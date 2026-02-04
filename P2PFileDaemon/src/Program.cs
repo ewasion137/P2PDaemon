@@ -19,8 +19,8 @@ namespace P2PFileDaemon
             while (true)
             {
                 Console.Clear();
-                AnsiConsole.Write(new FigletText("p2pdaemon").Color(Color.Lime));
-                AnsiConsole.MarkupLine("[grey]v1.4.0-salt-randomized | crypto_upd[/]");
+                AnsiConsole.Write(new FigletText("p2p daemon v1.4").Color(Color.LightGoldenrod1));
+                AnsiConsole.MarkupLine("[grey]v1.4.1-salt-randomized | ip_upd_peer[/]");
                 Console.WriteLine("-------------------------------------------");
 
                 var choice = AnsiConsole.Prompt(
