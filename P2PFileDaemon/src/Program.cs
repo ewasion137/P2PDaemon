@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
@@ -62,41 +62,44 @@ namespace P2PFileDaemon
                 sourceHash = await CalculateHashAsync(path);
             });
 
-            TcpListener listener = new TcpListener(IPAddress.Any, Port);
+            // =============================================================
+            // НОВЫЙ БЛОК: ВЫБОР IP-АДРЕСА
+            // =============================================================
+            string selectedIp = SelectLocalIP();
+            if (string.IsNullOrEmpty(selectedIp))
+            {
+                AnsiConsole.MarkupLine("[red]err:[/] no network interface selected.");
+                return;
+            }
+
+            TcpListener listener = new TcpListener(IPAddress.Parse(selectedIp), Port); // Слушаем на ВЫБРАННОМ IP
             try
             {
                 listener.Start();
-                AnsiConsole.MarkupLine($"[grey]info:[/] listener_on: [yellow]{GetLocalIP()}[/]:{Port}");
+                AnsiConsole.MarkupLine($"[grey]info:[/] listener_on: [yellow]{selectedIp}[/]:{Port}");
                 AnsiConsole.MarkupLine("[blink yellow]wait:[/] awaiting_peer...");
 
+                // ... остальной код RunSender остается без изменений ...
                 using var client = await listener.AcceptTcpClientAsync();
                 using var networkStream = client.GetStream();
 
-                // 1. ГЕНЕРИРУЕМ СЛУЧАЙНУЮ СОЛЬ (16 байт)
                 byte[] salt = RandomNumberGenerator.GetBytes(16);
-
-                // 2. Генерация ключей с ЭТОЙ солью
                 using Aes aes = Aes.Create();
                 var keyMaterial = DeriveKey(password, salt);
                 aes.Key = keyMaterial.key;
                 aes.IV = keyMaterial.iv;
 
-                // 3. Отправляем Метаданные
                 var meta = new { name = info.Name, size = info.Length, hash = sourceHash };
                 byte[] metaData = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(meta) + "\n");
                 await networkStream.WriteAsync(metaData);
+                await networkStream.WriteAsync(salt);
+                await networkStream.WriteAsync(aes.IV);
 
-                // 4. Отправляем СОЛЬ и IV (они не секретны, секретен только пароль)
-                await networkStream.WriteAsync(salt); // 16 байт
-                await networkStream.WriteAsync(aes.IV); // 16 байт
-
-                // 5. Отправляем AUTH TOKEN
                 byte[] encryptedAuth;
                 using (var ms = new MemoryStream())
                 using (var cs = new CryptoStream(ms, aes.CreateEncryptor(), CryptoStreamMode.Write))
                 {
-                    byte[] authBytes = Encoding.UTF8.GetBytes("AUTH_OK");
-                    await cs.WriteAsync(authBytes);
+                    await cs.WriteAsync(Encoding.UTF8.GetBytes("AUTH_OK"));
                     await cs.FlushFinalBlockAsync();
                     encryptedAuth = ms.ToArray();
                 }
@@ -104,21 +107,16 @@ namespace P2PFileDaemon
                 await networkStream.WriteAsync(encryptedAuth);
 
                 AnsiConsole.MarkupLine("[grey]sync:[/] verifying_credentials...");
-
-                // 6. ЖДЕМ ПОДТВЕРЖДЕНИЯ ОТ ПОЛУЧАТЕЛЯ (ACK)
-                // Если пароль неверный, получатель разорвет связь, и мы не получим байт "1"
                 byte[] ackBuffer = new byte[1];
                 int ackRead = await networkStream.ReadAsync(ackBuffer, 0, 1);
 
                 if (ackRead == 0 || ackBuffer[0] != 1)
                 {
-                    AnsiConsole.MarkupLine("[bold red]err:[/] peer_auth_failed (wrong password). disconnected.");
+                    AnsiConsole.MarkupLine("[bold red]err:[/] peer_auth_failed.");
                     return;
                 }
 
                 AnsiConsole.MarkupLine("[green]auth:[/] approved. streaming_data...");
-
-                // 7. ПЕРЕДАЧА ФАЙЛА
                 using var cryptoStream = new CryptoStream(networkStream, aes.CreateEncryptor(), CryptoStreamMode.Write);
                 await AnsiConsole.Progress()
                     .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new DownloadedColumn(), new TransferSpeedColumn())
@@ -129,17 +127,10 @@ namespace P2PFileDaemon
                         using var fs = new System.IO.FileStream(path, FileMode.Open, FileAccess.Read);
                         byte[] buffer = new byte[BufferSize];
                         int read;
-                        try
+                        while ((read = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
                         {
-                            while ((read = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                            {
-                                await cryptoStream.WriteAsync(buffer, 0, read);
-                                task.Increment(read);
-                            }
-                        }
-                        catch (IOException)
-                        {
-                            throw new Exception("connection_lost_during_transfer");
+                            await cryptoStream.WriteAsync(buffer, 0, read);
+                            task.Increment(read);
                         }
                     });
 
@@ -288,22 +279,25 @@ namespace P2PFileDaemon
             }
         }
 
-        static string GetLocalIP()
+        static string? SelectLocalIP()
         {
             var host = Dns.GetHostEntry(Dns.GetHostName());
+            var ipList = host.AddressList
+                .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork) // Только IPv4
+                .Select(ip => ip.ToString())
+                .ToList();
 
-            // 1. Сначала ищем Radmin/VPN (обычно начинаются на 26.)
-            var vpnIp = host.AddressList.FirstOrDefault(i =>
-                i.AddressFamily == AddressFamily.InterNetwork && i.ToString().StartsWith("26."));
+            if (ipList.Count == 0) throw new Exception("no_network_adapters_found");
+            if (ipList.Count == 1) return ipList.First(); // Если IP один, не мучаем юзера
 
-            if (vpnIp != null) return vpnIp.ToString();
+            // Если IP несколько, даем выбор
+            AnsiConsole.MarkupLine("[yellow]multiple network interfaces detected.[/]");
+            var selectedIp = AnsiConsole.Prompt(
+                new SelectionPrompt<string>()
+                    .Title("select an [green]ip address[/] to broadcast:")
+                    .AddChoices(ipList));
 
-            // 2. Если VPN нет, ищем любой НОРМАЛЬНЫЙ IP (не 127.0.0.1)
-            var lanIp = host.AddressList.FirstOrDefault(i =>
-                i.AddressFamily == AddressFamily.InterNetwork &&
-                !i.ToString().StartsWith("127.")); // Игнорируем loopback
-
-            return lanIp?.ToString() ?? "127.0.0.1";
+            return selectedIp;
         }
 
         static void ShowHelp()
